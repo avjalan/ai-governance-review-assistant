@@ -6,6 +6,12 @@ from datetime import datetime, timezone
 import streamlit as st
 from dotenv import load_dotenv
 from groq import Groq
+from review_validation import validate_assessment
+from interview import QUESTIONS, HELP, to_form_values
+try:
+    from pdf_report import build_pdf_report
+except ImportError:
+    build_pdf_report = None
 
 
 # ============================================================
@@ -21,7 +27,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-MODEL_NAME = "openai/gpt-oss-120b"
+MODEL_NAME = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
 api_key = os.getenv("GROQ_API_KEY")
 
@@ -43,9 +49,37 @@ st.markdown(
     """
     <style>
         .block-container {
-            max-width: 1180px;
-            padding-top: 2.2rem;
+            max-width: 1040px;
+            padding-top: 3.5rem;
             padding-bottom: 4rem;
+        }
+
+        [data-testid="stAppViewContainer"] {
+            background: radial-gradient(circle at 90% 0%, #27214d 0, transparent 35%),
+                        linear-gradient(145deg, #090a12 0%, #111321 55%, #171329 100%);
+            color: #f4f2ff;
+        }
+
+        [data-testid="stForm"] {
+            background: rgba(24, 25, 42, .88);
+            border: 1px solid rgba(171, 151, 255, .22);
+            border-radius: 22px;
+            padding: 1.4rem;
+            box-shadow: 0 24px 70px rgba(0, 0, 0, .28);
+            animation: questionIn .42s cubic-bezier(.2,.8,.2,1);
+        }
+
+        @keyframes questionIn {
+            from { opacity: 0; transform: translateY(16px) scale(.985); }
+            to { opacity: 1; transform: translateY(0) scale(1); }
+        }
+
+        h1, h2, h3, p, label, [data-testid="stCaptionContainer"] { color: #f4f2ff !important; }
+        [data-testid="stCaptionContainer"], .subtitle { color: #aaa8bc !important; }
+        [data-baseweb="select"] > div, textarea, input {
+            background: #121420 !important;
+            color: #f4f2ff !important;
+            border-color: #35364b !important;
         }
 
         h1 {
@@ -59,9 +93,9 @@ st.markdown(
 
         .subtitle {
             font-size: 1.08rem;
-            color: #666;
+            color: #aaa8bc;
             max-width: 850px;
-            margin-bottom: .5rem;
+            margin-bottom: 1rem;
         }
 
         .eyebrow {
@@ -69,8 +103,9 @@ st.markdown(
             letter-spacing: 0.12em;
             font-size: 0.73rem;
             font-weight: 700;
-            color: #777;
-            margin-bottom: 0.25rem;
+            color: #b7a2ff;
+            margin: .5rem 0 1rem;
+            line-height: 1.6;
         }
 
         .trust-map {
@@ -89,8 +124,24 @@ st.markdown(
 
         .stButton > button,
         .stDownloadButton > button {
-            border-radius: 10px;
+            border-radius: 12px;
+            min-height: 2.8rem;
+            transition: transform .16s ease, box-shadow .16s ease;
         }
+
+        .stButton > button:hover,
+        .stDownloadButton > button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 18px rgba(58, 35, 120, .12);
+        }
+
+        button[kind="primary"] {
+            background: linear-gradient(90deg, #7657ff, #9e6cff);
+            border-color: #8a68ff;
+        }
+
+        [data-testid="stMetric"] { background: rgba(23, 24, 39, .75); }
+        [data-testid="stTabs"] { display: none; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -131,6 +182,27 @@ def score_label(score):
 
 def safe_list(value):
     return value if isinstance(value, list) else []
+
+
+def build_risk_reduction_options(intake, domains):
+    """Translate elevated risks into concrete controls and architecture choices."""
+    options = []
+    scores = {name: normalize_score(value.get("score", 0)) for name, value in domains.items() if isinstance(value, dict)}
+    if scores.get("privacy", 0) >= 6:
+        options.append({"title": "Reduce data exposure", "action": "Remove unnecessary personal data, redact inputs, shorten retention, and use an approved zero-retention enterprise endpoint. If the use case permits it, evaluate a company-hosted or on-device model."})
+    if scores.get("ai_security", 0) >= 6 or scores.get("security", 0) >= 6:
+        options.append({"title": "Limit what the AI can reach", "action": "Give it the minimum permissions, isolate untrusted content, require approval before tool actions, and test prompt-injection and data-exfiltration scenarios."})
+    if scores.get("reliability", 0) >= 6:
+        options.append({"title": "Narrow and verify the task", "action": "Ground answers in approved sources, show citations, test representative cases, and require a person to check consequential output. Compare models on your own evaluation set before switching."})
+    if scores.get("compliance", 0) >= 6:
+        options.append({"title": "Add accountable review", "action": "Document the purpose, owner, affected people, appeal path, and approval record. Route the use case to the appropriate legal, privacy, HR, or compliance reviewer."})
+    if scores.get("intellectual_property", 0) >= 6:
+        options.append({"title": "Control source and output rights", "action": "Use approved or licensed source material, record provenance, restrict reuse of protected content, and review outputs before publication."})
+    if intake.get("model_source") == "Third-party cloud model" and (intake.get("provider_retention") == "Unknown" or intake.get("training_use") == "Unknown"):
+        options.append({"title": "Verify the provider before choosing a model", "action": "Confirm retention, training use, regional processing, access controls, and deletion terms. Prefer an approved enterprise configuration; consider private hosting or on-device inference when the data sensitivity justifies it."})
+    if not options:
+        options.append({"title": "Keep the review valid", "action": "Document the owner, test the intended workflow, monitor changes, and run a new review whenever the data, model, audience, or permissions change."})
+    return options[:4]
 
 
 def is_unknown(value):
@@ -870,15 +942,6 @@ def load_demo():
 # HEADER
 # ============================================================
 
-st.markdown(
-    (
-        '<div class="eyebrow">'
-        'Continuous AI Launch Readiness'
-        '</div>'
-    ),
-    unsafe_allow_html=True,
-)
-
 st.title(
     "LaunchGate"
 )
@@ -886,9 +949,8 @@ st.title(
 st.markdown(
     """
     <div class="subtitle">
-    Turn an AI system into an explainable deployment decision:
-    what could fail, what evidence is missing, what must be tested,
-    and which assumptions must remain true after launch.
+    Tell us how your team plans to use AI. We’ll ask a few questions,
+    then show what needs attention before it goes live.
     </div>
     """,
     unsafe_allow_html=True,
@@ -896,550 +958,124 @@ st.markdown(
 
 st.caption(
     (
-        "Prototype · Preliminary decision support · "
-        "Human approval required"
+        "AI use case review · About 5 minutes · A person makes the final decision"
     )
 )
 
-demo_col, _ = st.columns(
-    [1, 4]
-)
+with st.expander("How LaunchGate reaches a recommendation"):
+    st.markdown("""
+    **1. Hard safety gates:** explicit rules block or pause uses with missing human oversight, powerful actions, sensitive data, or unresolved provider terms.
 
-with demo_col:
+    **2. Six risk areas:** the AI analyzes privacy, security, AI security, reliability, intellectual property, and compliance on a 0-10 scale. Unknown facts become evidence requests rather than automatically becoming low risk.
 
-    st.button(
-        "Load Demo Scenario",
-        on_click=load_demo,
-        use_container_width=True,
-    )
+    **3. Framework organization:** NIST AI RMF informs Govern, Map, Measure, and Manage activities; ISO/IEC 42001 informs ownership and lifecycle controls; OWASP guidance informs prompt injection, data disclosure, excessive agency, and other LLM-specific scenarios.
+
+    **4. Human decision:** the score explains where to focus. It never grants launch approval or claims certification.
+    """)
+
+if "interview_answers" not in st.session_state:
+    st.session_state.interview_answers = {}
+if "interview_step" not in st.session_state:
+    st.session_state.interview_step = 0
+if "interview_complete" not in st.session_state:
+    st.session_state.interview_complete = False
+
+if not st.session_state.interview_complete:
+    step = st.session_state.interview_step
+    field, question, kind, options, required = QUESTIONS[step]
+    saved = st.session_state.interview_answers.get(field)
+    st.progress(step / len(QUESTIONS), text=f"Question {step + 1} of {len(QUESTIONS)}")
+    st.subheader(question)
+    if field in HELP:
+        st.write(HELP[field])
+    st.caption("For this demo, use fictional or public details. Avoid confidential documents.")
+    with st.form(f"interview_question_{step}"):
+        if kind == "text":
+            answer = st.text_area("Your answer", value=saved or "", height=130)
+        elif kind == "short":
+            answer = st.text_input("Your answer", value=saved or "")
+        elif kind == "multiple":
+            answer = st.multiselect("Select all that apply", options, default=saved or [])
+        elif kind == "profile":
+            prior = saved or {}
+            retention = st.selectbox("Can the AI provider keep submitted data?", ["Unknown", "Provider does not retain inputs", "Provider may retain inputs", "No third-party processing"], index=["Unknown", "Provider does not retain inputs", "Provider may retain inputs", "No third-party processing"].index(prior.get("provider_retention", "Unknown")))
+            training = st.selectbox("Can submitted data be used to train models?", ["Unknown", "No", "Yes", "Not applicable"], index=["Unknown", "No", "Yes", "Not applicable"].index(prior.get("training_use", "Unknown")))
+            logging = st.selectbox("Are interactions recorded for investigation?", ["Not decided", "Yes", "Partially", "No"], index=["Not decided", "Yes", "Partially", "No"].index(prior.get("logging", "Not decided")))
+            untrusted_options = ["Unknown", "No", "Yes — documents", "Yes — websites", "Yes — email/messages", "Yes — user-generated content", "Multiple sources"]
+            untrusted = st.selectbox("Will it read outside files, websites, messages, or user content?", untrusted_options, index=untrusted_options.index(prior.get("untrusted_content", "Unknown")))
+            answer = {"provider_retention": retention, "training_use": training, "logging": logging, "untrusted_content": untrusted}
+        else:
+            answer = st.selectbox("Choose an answer", options, index=options.index(saved) if saved in options else 0)
+        submitted = st.form_submit_button(
+            "Generate review" if step == len(QUESTIONS) - 1 else "Next question",
+            type="primary",
+        )
+    if step:
+        if st.button("Previous question"):
+            st.session_state.interview_step -= 1
+            st.rerun()
+    if submitted:
+        if required and not answer.strip():
+            st.warning("Please answer this question to continue.")
+        else:
+            st.session_state.interview_answers[field] = answer
+            if step == len(QUESTIONS) - 1:
+                st.session_state.demo_values = to_form_values(st.session_state.interview_answers)
+                st.session_state.interview_complete = True
+                st.session_state.interview_run = True
+            else:
+                st.session_state.interview_step += 1
+            st.rerun()
+    st.stop()
+
+if st.button("Start a new interview"):
+    st.session_state.interview_answers = {}
+    st.session_state.interview_step = 0
+    st.session_state.interview_complete = False
+    st.session_state.demo_values = {}
+    st.rerun()
+
+st.caption("Your preliminary review is ready below. A person must verify evidence before any launch decision.")
 
 d = st.session_state.demo_values
 
 
-# ============================================================
-# 1. DEFINE SYSTEM
-# ============================================================
-
-st.header(
-    "1. Define the system"
-)
-
-left, right = st.columns(
-    2
-)
-
-with left:
-
-    use_case = st.text_area(
-        "System purpose *",
-        value=d.get(
-            "use_case",
-            "",
-        ),
-        height=145,
-        placeholder=(
-            "Describe what the AI "
-            "system is intended to do."
-        ),
-    )
-
-    users = st.text_input(
-        "Primary users",
-        value=d.get(
-            "users",
-            "",
-        ),
-        placeholder=(
-            "Example: Legal operations "
-            "and corporate attorneys"
-        ),
-    )
-
-    business_options = [
-        "Legal",
-        "Engineering",
-        "Security",
-        "Privacy",
-        "HR",
-        "Finance",
-        "Operations",
-        "Customer Support",
-        "Other",
-    ]
-
-    business_owner = st.selectbox(
-        "Business owner",
-        business_options,
-        index=business_options.index(
-            d.get(
-                "business_owner",
-                "Legal",
-            )
-        ),
-    )
-
-with right:
-
-    data_description = st.text_area(
-        "Data processed *",
-        value=d.get(
-            "data_description",
-            "",
-        ),
-        height=145,
-        placeholder=(
-            "Describe the information "
-            "the system will process."
-        ),
-    )
-
-    deployment_options = [
-        "Internal tool",
-        "Employee-facing product",
-        "Customer-facing product",
-        "Public-facing experience",
-        "Developer tool",
-        "Research / experiment",
-    ]
-
-    deployment_environment = st.selectbox(
-        "Deployment environment",
-        deployment_options,
-        index=deployment_options.index(
-            d.get(
-                "deployment_environment",
-                "Internal tool",
-            )
-        ),
-    )
-
-    lifecycle_options = [
-        "Concept",
-        "Prototype",
-        "Pilot",
-        "Pre-production",
-        "Production",
-    ]
-
-    lifecycle_stage = st.selectbox(
-        "Current stage",
-        lifecycle_options,
-        index=lifecycle_options.index(
-            d.get(
-                "lifecycle_stage",
-                "Concept",
-            )
-        ),
-    )
-
-
-st.subheader(
-    "Data classification"
-)
-
-c1, c2, c3 = st.columns(
-    3
-)
-
-with c1:
-
-    personal = st.checkbox(
-        "Personal information",
-        value=d.get(
-            "personal",
-            False,
-        ),
-    )
-
-    sensitive_personal = st.checkbox(
-        "Sensitive personal information",
-        value=d.get(
-            "sensitive_personal",
-            False,
-        ),
-    )
-
-with c2:
-
-    confidential = st.checkbox(
-        "Confidential company data",
-        value=d.get(
-            "confidential",
-            False,
-        ),
-    )
-
-    customer = st.checkbox(
-        "Customer data",
-        value=d.get(
-            "customer",
-            False,
-        ),
-    )
-
-with c3:
-
-    financial = st.checkbox(
-        "Financial data",
-        value=d.get(
-            "financial",
-            False,
-        ),
-    )
-
-    regulated = st.checkbox(
-        "Potentially regulated data",
-        value=d.get(
-            "regulated",
-            False,
-        ),
-    )
-
-
-# ============================================================
-# 2. MAP AI BEHAVIOR
-# ============================================================
-
-st.divider()
-
-st.header(
-    "2. Map the AI behavior"
-)
-
-left, right = st.columns(
-    2
-)
-
-with left:
-
-    model_options = [
-        "Third-party cloud model",
-        "Company-hosted model",
-        "On-device model",
-        "Hybrid / multiple models",
-        "Not decided",
-    ]
-
-    model_source = st.selectbox(
-        "Model architecture",
-        model_options,
-        index=model_options.index(
-            d.get(
-                "model_source",
-                "Third-party cloud model",
-            )
-        ),
-    )
-
-    model_provider = st.text_input(
-        "Model or provider",
-        value=d.get(
-            "model_provider",
-            "",
-        ),
-        placeholder=(
-            "Example: Groq, internal model, vendor API..."
-        ),
-    )
-
-    visibility_options = [
-        "Internal users only",
-        "Authorized external users",
-        "Customers",
-        "Public",
-        "Multiple audiences",
-        "Not decided",
-    ]
-
-    external_visibility = st.selectbox(
-        "Output exposure",
-        visibility_options,
-        index=visibility_options.index(
-            d.get(
-                "external_visibility",
-                "Internal users only",
-            )
-        ),
-    )
-
-with right:
-
-    review_options = [
-        "Always",
-        "For high-impact outputs only",
-        "Sometimes",
-        "No",
-        "Not decided",
-    ]
-
-    human_review = st.selectbox(
-        "Human review before output is acted on",
-        review_options,
-        index=review_options.index(
-            d.get(
-                "human_review",
-                "Always",
-            )
-        ),
-    )
-
-    decision_options = [
-        "No",
-        "Provides recommendations",
-        "Materially influences decisions",
-        "Makes automated decisions",
-        "Not sure",
-    ]
-
-    decision_impact = st.selectbox(
-        "Does AI influence decisions about people?",
-        decision_options,
-        index=decision_options.index(
-            d.get(
-                "decision_impact",
-                "No",
-            )
-        ),
-    )
-
-    action_options = [
-        "No — output only",
-        "Can retrieve data",
-        "Can modify data",
-        "Can call tools / APIs",
-        "Can trigger real-world actions",
-        "Not decided",
-    ]
-
-    agentic_capability = st.selectbox(
-        "Can the AI take actions beyond generating content?",
-        action_options,
-        index=action_options.index(
-            d.get(
-                "agentic_capability",
-                "No — output only",
-            )
-        ),
-    )
-
-
-# ============================================================
-# 3. TRUST BOUNDARIES
-# ============================================================
-
-st.divider()
-
-st.header(
-    "3. Define trust boundaries"
-)
-
-st.caption(
-    (
-        "Identify where data leaves controlled environments "
-        "and which external inputs or systems must be trusted."
-    )
-)
-
-left, right = st.columns(
-    2
-)
-
-with left:
-
-    if (
-        model_source
-        == "Third-party cloud model"
-    ):
-
-        retention_options = [
-            "Unknown",
-            "Provider does not retain inputs",
-            "Provider may retain inputs",
-        ]
-
-        desired_retention = d.get(
-            "provider_retention",
-            "Unknown",
-        )
-
-        if (
-            desired_retention
-            not in retention_options
-        ):
-            desired_retention = "Unknown"
-
-        provider_retention = st.selectbox(
-            "Provider data retention",
-            retention_options,
-            index=retention_options.index(
-                desired_retention
-            ),
-        )
-
-    else:
-
-        retention_options = [
-            "No third-party processing",
-            "Unknown",
-        ]
-
-        desired_retention = d.get(
-            "provider_retention",
-            "No third-party processing",
-        )
-
-        if (
-            desired_retention
-            not in retention_options
-        ):
-            desired_retention = (
-                "No third-party processing"
-            )
-
-        provider_retention = st.selectbox(
-            "Third-party data retention",
-            retention_options,
-            index=retention_options.index(
-                desired_retention
-            ),
-        )
-
-    training_options = [
-        "No",
-        "Yes",
-        "Unknown",
-        "Not applicable",
-    ]
-
-    desired_training = d.get(
-        "training_use",
-        "No",
-    )
-
-    if (
-        desired_training
-        not in training_options
-    ):
-        desired_training = "No"
-
-    training_use = st.selectbox(
-        "Can submitted data be used for model training?",
-        training_options,
-        index=training_options.index(
-            desired_training
-        ),
-    )
-
-with right:
-
-    untrusted_options = [
-        "No",
-        "Yes — documents",
-        "Yes — websites",
-        "Yes — email/messages",
-        "Yes — user-generated content",
-        "Multiple sources",
-        "Unknown",
-    ]
-
-    untrusted_content = st.selectbox(
-        "Will the model process untrusted external content?",
-        untrusted_options,
-        index=untrusted_options.index(
-            d.get(
-                "untrusted_content",
-                "No",
-            )
-        ),
-    )
-
-    logging_options = [
-        "Yes",
-        "Partially",
-        "No",
-        "Not decided",
-    ]
-
-    logging = st.selectbox(
-        "Are AI interactions logged for investigation/audit?",
-        logging_options,
-        index=logging_options.index(
-            d.get(
-                "logging",
-                "Yes",
-            )
-        ),
-    )
-
-
-additional_context = st.text_area(
-    "Architecture, safeguards, or additional context",
-    value=d.get(
-        "additional_context",
-        "",
-    ),
-    placeholder=(
-        "Optional: access controls, redaction, sandboxing, "
-        "retrieval architecture, evaluation results, "
-        "vendor guarantees, retention controls..."
-    ),
-)
-
-
-# ============================================================
-# SYSTEM MODEL
-# ============================================================
-
-st.subheader(
-    "System model"
-)
-
-provider_label = (
-    model_provider.strip()
-    or "Model Provider"
-)
-
-if (
-    model_source
-    == "Third-party cloud model"
-):
-
-    trust_map = (
-        f"{users or 'User'} → Application → "
-        f"[ External trust boundary ] → "
-        f"{provider_label} → Output"
-    )
-
-elif (
-    model_source
-    == "On-device model"
-):
-
-    trust_map = (
-        f"{users or 'User'} → Application → "
-        "On-device model → Output"
-    )
-
-else:
-
-    trust_map = (
-        f"{users or 'User'} → Application → "
-        f"{provider_label} → Output"
-    )
-
-
-st.markdown(
-    f"""
-    <div class="trust-map">
-        <strong>{trust_map}</strong><br><br>
-        <span style="color:#777;">
-            Data: {data_description or "Not yet described"}
-        </span>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
+# The guided interview is the only employee-facing intake.
+# Keep these values compatible with the existing review engine.
+use_case = d.get("use_case", "")
+users = d.get("users", "")
+business_owner = d.get("business_owner", "Other")
+data_description = d.get("data_description", "")
+deployment_environment = d.get("deployment_environment", "Internal tool")
+lifecycle_stage = d.get("lifecycle_stage", "Concept")
+personal = d.get("personal", False)
+sensitive_personal = d.get("sensitive_personal", False)
+confidential = d.get("confidential", False)
+customer = d.get("customer", False)
+financial = d.get("financial", False)
+regulated = d.get("regulated", False)
+model_source = d.get("model_source", "Not decided")
+model_provider = d.get("model_provider", "")
+external_visibility = d.get("external_visibility", "Not decided")
+human_review = d.get("human_review", "Not decided")
+decision_impact = d.get("decision_impact", "Not sure")
+agentic_capability = d.get("agentic_capability", "Not decided")
+provider_retention = d.get("provider_retention", "Unknown")
+training_use = d.get("training_use", "Unknown")
+untrusted_content = d.get("untrusted_content", "Unknown")
+logging = d.get("logging", "Not decided")
+additional_context = d.get("additional_context", "")
+
+with st.expander("Check your answers", expanded=False):
+    st.write(f"**What it does:** {use_case}")
+    st.write(f"**Who uses it:** {users or 'Not specified'}")
+    st.write(f"**Information used:** {data_description}")
+    st.write(f"**Human review:** {human_review}")
+    st.write(f"**Model setup:** {model_source}")
+    if st.button("Change an answer"):
+        st.session_state.interview_step = 0
+        st.session_state.interview_complete = False
+        st.rerun()
 
 # ============================================================
 # RUN REVIEW
@@ -1448,10 +1084,10 @@ st.markdown(
 st.divider()
 
 generate = st.button(
-    "Run Launch Review",
+    "Run review again",
     type="primary",
     use_container_width=True,
-)
+) or st.session_state.pop("interview_run", False)
 
 
 if generate:
@@ -1879,12 +1515,12 @@ Be concise and technically specific.
                 )
             )
 
-        result = json.loads(
+        result = validate_assessment(json.loads(
             response
             .choices[0]
             .message
             .content
-        )
+        ))
 
     except json.JSONDecodeError:
 
@@ -1898,12 +1534,16 @@ Be concise and technically specific.
 
         st.stop()
 
-    except Exception as error:
+    except ValueError as error:
+        st.error(f"The model returned an incomplete assessment: {error} Please run the review again.")
+        st.stop()
+
+    except Exception:
 
         st.error(
             (
                 "Unable to generate "
-                f"the review: {error}"
+                "the review. Check the API key, selected model, and provider availability, then retry."
             )
         )
 
@@ -2017,6 +1657,8 @@ Be concise and technically specific.
         )
     )
 
+    reduction_options = build_risk_reduction_options(intake, domains)
+
 
     # ========================================================
     # LAUNCH DECISION
@@ -2033,40 +1675,30 @@ Be concise and technically specific.
         unsafe_allow_html=True,
     )
 
-    st.header(
-        "Launch decision"
-    )
+    st.header("Your review")
 
 
     if gate == "BLOCKED":
 
-        st.error(
-            "BLOCKED"
-        )
+        st.error("Do not launch yet · A critical safeguard is missing")
 
     elif gate == "EVIDENCE REQUIRED":
 
-        st.warning(
-            "EVIDENCE REQUIRED"
-        )
+        st.warning("More information needed before review")
 
     elif gate == "CONDITIONAL":
 
-        st.warning(
-            "CONDITIONAL"
-        )
+        st.warning("Specialist review and safeguards needed")
 
     else:
 
-        st.success(
-            "READY FOR REVIEW"
-        )
+        st.success("Ready for a person's review")
 
 
     st.caption(
         (
-            "Decision generated by LaunchGate's "
-            "deterministic policy engine."
+            "This is a preliminary recommendation based on your answers. "
+            "It does not grant permission to launch."
         )
     )
 
@@ -2083,6 +1715,13 @@ Be concise and technically specific.
             "",
         )
     )
+
+    st.subheader("What to do next")
+    for index, option in enumerate(reduction_options, start=1):
+        st.markdown(f"**{index}. {option['title']}**")
+        st.write(option["action"])
+
+    st.caption("A different model can reduce some privacy, security, cost, or performance risks, but it cannot fix an unsafe workflow by itself. Compare candidate models using your own data, tests, and vendor terms.")
 
 
     # ========================================================
@@ -2131,9 +1770,7 @@ Be concise and technically specific.
     # RISK SURFACE
     # ========================================================
 
-    st.subheader(
-        "Risk surface"
-    )
+    st.subheader("Areas to check")
 
     a, b, c = st.columns(
         3
@@ -2204,13 +1841,13 @@ Be concise and technically specific.
         controls_tab,
     ) = st.tabs(
         [
-            "Risk analysis",
-            "Assumptions",
-            "Evidence",
-            "Threat model",
-            "Evaluations",
-            "Review workflow",
-            "Continuous controls",
+            "Potential risks",
+            "What we assumed",
+            "Information needed",
+            "What could go wrong",
+            "Tests to run",
+            "People to involve",
+            "After launch",
         ]
     )
 
@@ -2712,23 +2349,29 @@ Be concise and technically specific.
 
     st.divider()
 
-    st.subheader(
-        "Review record"
-    )
+    st.subheader("Take the review with you")
 
-    st.download_button(
-        "Download structured review",
-        data=json.dumps(
-            review_record,
-            indent=2,
-        ),
-        file_name=(
-            f"{review_id.lower()}-"
-            "launch-review.json"
-        ),
-        mime="application/json",
-        use_container_width=True,
-    )
+    if build_pdf_report:
+        pdf_bytes = build_pdf_report(review_record, reduction_options)
+        st.download_button(
+            "Download detailed PDF report",
+            data=pdf_bytes,
+            file_name=f"{review_id.lower()}-launchgate-report.pdf",
+            mime="application/pdf",
+            type="primary",
+            use_container_width=True,
+        )
+    else:
+        st.info("PDF downloads require the reportlab package. Install the project requirements, then restart the app.")
+
+    with st.expander("Technical export"):
+        st.download_button(
+            "Download JSON",
+            data=json.dumps(review_record, indent=2),
+            file_name=f"{review_id.lower()}-launch-review.json",
+            mime="application/json",
+            use_container_width=True,
+        )
 
     st.caption(
         (
